@@ -11,6 +11,7 @@ import re
 import signal
 import sys
 import threading
+import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -44,9 +45,17 @@ _model_cycle = itertools.cycle([""])
 _model_lock = threading.Lock()
 
 
+_ctrl_c_count = 0
+
+
 def _signal_handler(sig, frame):
-    print("\n收到中断信号，正在优雅退出...")
+    global _ctrl_c_count
+    _ctrl_c_count += 1
     _shutdown_flag.set()
+    if _ctrl_c_count >= 2:
+        print("\n强制退出!")
+        os._exit(1)
+    print("\n收到中断信号，正在优雅退出...（再按一次强制退出）")
 
 
 signal.signal(signal.SIGINT, _signal_handler)
@@ -66,7 +75,15 @@ save_interval = 10
 [api]
 key = ""
 base_url = "https://api.siliconflow.cn/v1"
-models = ["zai-org/GLM-4.6V"]
+models = [
+    "zai-org/GLM-4.6V", 
+    "Qwen/Qwen3-VL-32B-Instruct",
+    "Qwen/Qwen3-VL-8B-Instruct",
+    "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    "Qwen/Qwen3-VL-235B-A22B-Instruct",
+    "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    "deepseek-ai/DeepSeek-OCR"
+]
 
 [file_dirs]
 input_dir = "."
@@ -112,9 +129,9 @@ def init_globals(cfg: dict, args):
     # DPI: 命令行 > 配置文件 > 默认200
     DPI = args.dpi or SETTINGS.get("dpi", 200)
 
-    # Workers: --w-full 使用 CPU 核心数*4, -w 指定, 否则配置文件
+    # Workers: --w-full 使用 CPU 核心数*4(上限32), -w 指定, 否则配置文件
     if args.w_full:
-        MAX_WORKERS = os.cpu_count() * 4 or 32
+        MAX_WORKERS = min((os.cpu_count() or 4) * 4, 32)
     elif args.workers:
         MAX_WORKERS = args.workers
     else:
@@ -221,23 +238,41 @@ def ocr_tesseract(image_bytes: bytes) -> str:
 
 
 def ocr_vlm(image_bytes: bytes) -> str:
+    if _shutdown_flag.is_set():
+        return ""
     model = next_model()
     try:
         b64 = base64.b64encode(image_bytes).decode()
-        client = OpenAI(api_key=API_KEY, base_url=API_BASE, timeout=30)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    {"type": "text", "text": "请提取这张图片中的所有文字内容，保留原文的标题、段落、列表等格式，使用Markdown语法输出。仅输出提取的内容，不要有其他解释，不要输出代码块标和特殊标签。"},
-                ],
-            }],
-            max_tokens=4096,
-        )
-        content = resp.choices[0].message.content.strip()
-        return clean_markdown(content)
+        client = OpenAI(api_key=API_KEY, base_url=API_BASE, timeout=120)
+        for attempt in range(3):
+            if _shutdown_flag.is_set():
+                return ""
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                            {"type": "text", "text": "请提取这张图片中的所有文字内容，保留原文的标题、段落、列表等格式，使用Markdown语法输出。仅输出提取的内容，不要有其他解释，不要输出代码块标和特殊标签。"},
+                        ],
+                    }],
+                    max_tokens=4096,
+                )
+                content = resp.choices[0].message.content.strip()
+                return clean_markdown(content)
+            except Exception as e:
+                if attempt < 2 and not _shutdown_flag.is_set():
+                    err_str = str(e).lower()
+                    is_retryable = "429" in err_str or "rate" in err_str or "connection" in err_str or "timeout" in err_str
+                    if not is_retryable:
+                        raise
+                    wait = (attempt + 1) * 3
+                    print(f"  [VLM 重试 {attempt + 1}/3 model={model}] {e} (等待{wait}s)")
+                    time.sleep(wait)
+                    model = next_model()
+                    continue
+                raise
     except Exception as e:
         print(f"  [VLM API 失败 model={model}] {e}")
         return ""
@@ -245,6 +280,8 @@ def ocr_vlm(image_bytes: bytes) -> str:
 
 def process_ocr_page(args: tuple) -> tuple[int, str]:
     idx, total, method, text, image_bytes = args
+    if _shutdown_flag.is_set():
+        return idx, text
     print(f"  OCR 第 {idx + 1}/{total} 页 [method={method}]...")
 
     if method == "ai":
@@ -288,6 +325,9 @@ def extract_pdf_method(filepath: Path, default_method: str = "auto") -> str:
     def _collect_result(future, idx):
         try:
             _, text = future.result()
+            if not text and not _shutdown_flag.is_set():
+                print(f"  [页 {idx + 1} 结果为空，将在下次运行时重试]")
+                return
             with results_lock:
                 results[idx] = text
                 _unsaved_count[0] += 1
@@ -297,7 +337,7 @@ def extract_pdf_method(filepath: Path, default_method: str = "auto") -> str:
         except Exception as e:
             print(f"  [页 {idx + 1} 失败] {e}")
 
-    ocr_queue = queue.Queue(maxsize=MAX_WORKERS * 2)
+    ocr_queue = queue.Queue(maxsize=MAX_WORKERS)
     done_event = threading.Event()
     _executor_ref = [None]
 
@@ -442,4 +482,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\n程序异常退出: {e}", file=sys.stderr)
+        sys.exit(1)
