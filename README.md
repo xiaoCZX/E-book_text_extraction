@@ -18,12 +18,18 @@ pip install -r requirements.txt
 python extract_text.py
 ```
 
+也可以用模块方式运行：
+
+```bash
+python -m extract_text
+```
+
 不带任何文件参数时，默认处理 input 目录下所有 epub/pdf 文件。
 
 ## 命令行参数
 
 ```
-python extract_text.py [files] [-f FILE ...] [-m METHOD] [-w N] [--w-full] [--dpi N] [-c PATH]
+python extract_text.py [files] [-f FILE ...] [-m METHOD] [-w N] [--w-full] [--dpi N] [--clean] [-c PATH]
 ```
 
 | 参数 | 说明 |
@@ -34,6 +40,7 @@ python extract_text.py [files] [-f FILE ...] [-m METHOD] [-w N] [--w-full] [--dp
 | `-w, --workers` | 并行线程数 |
 | `--w-full` | 使用最高线程数（CPU核心数×4，上限32） |
 | `--dpi` | PDF 渲染 DPI（默认200，推荐扫描版用300） |
+| `--clean` | 使用文本模型清洗 VLM 输出（需配置 `clean_model`） |
 | `-c, --config` | 自定义配置文件路径（默认 `extract_config.toml`） |
 
 ### 使用示例
@@ -53,6 +60,9 @@ python extract_text.py -f book1.pdf book2.pdf
 
 # 自定义配置文件
 python extract_text.py -c my_config.toml
+
+# 使用文本模型清洗 VLM 输出
+python extract_text.py --clean
 ```
 
 ## 处理方法说明
@@ -87,6 +97,12 @@ base_url = "https://api.siliconflow.cn/v1"
 models = [
     "zai-org/GLM-4.6V",
     "Qwen/Qwen3-VL-32B-Instruct"
+]
+# 文本清洗模型（配合 --clean 使用）
+clean_model = "Qwen/Qwen3-32B"
+# tool 判断模型（快速判断是否需要清洗，支持多模型轮询）
+tool_models = [
+    "Qwen/Qwen3-8B",
 ]
 
 [file_dirs]
@@ -144,3 +160,41 @@ API 调用遇到以下错误时会自动重试（最多3次），并切换到下
 - `max_workers` 建议根据 API 限流设置，硅基流动推荐 10-20
 - `--dpi 300` 会显著增加内存占用，建议配合较低的 workers 使用
 - 多模型轮询可以有效分散限流压力
+
+## 文本清洗
+
+使用 `--clean` 参数可在 VLM 识别完成后，用文本模型对每页结果进行清洗，修正 OCR 错误、去除乱码和模型幻觉。
+
+需要在配置文件 `[api]` 中设置 `clean_model` 和 `tool_model`：
+
+```toml
+[api]
+clean_model = "Qwen/Qwen3-32B"
+tool_models = ["Qwen/Qwen3-8B"]
+```
+
+- `tool_models`：小模型列表，支持多模型轮询，用于快速判断文本是否需要清洗（`max_tokens=1`，只回答Y/N）
+- `clean_model`：大模型，用于实际清洗文本内容
+- 如果不配置 `tool_models`，会自动使用 `clean_model` 做判断
+
+清洗时会自动传入上下页文本作为上下文，帮助模型更准确地修正跨页内容。
+
+清洗采用三级过滤，避免不必要的 API 调用：
+1. 本地规则检测（JSON转义残留、重复段落、异常短行）→ 命中直接清洗
+2. 文本模型快速判断（`max_tokens=1`，只回答Y/N）→ 判断需要才清洗
+3. 通过前两级的文本视为正常，跳过清洗
+
+## 项目结构
+
+```
+extract_text.py              # 兼容入口
+extract_text/
+├── __init__.py              # 包标记
+├── __main__.py              # 命令行入口（python -m extract_text）
+├── config.py                # 配置管理（AppConfig 数据类）
+├── utils.py                 # 工具函数（信号处理、页码解析）
+├── progress.py              # 断点续传（进度加载/保存）
+├── ocr.py                   # OCR 引擎（Tesseract + VLM API）
+├── clean.py                 # 文本清洗（垃圾检测 + 智能清洗）
+└── extractors.py            # 文件提取（EPUB/PDF 处理）
+```
