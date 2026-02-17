@@ -18,9 +18,25 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r'<\|end_of_box\|>', '', text)
     text = re.sub(r'```markdown\s*', '', text)
     text = re.sub(r'```\s*', '', text)
+    # 清除 HTML 标签残留
+    text = re.sub(r'</?(?:u|b|i|em|strong|h[1-6]|span|div|p|br|hr)\s*/?>', '', text, flags=re.IGNORECASE)
+    # 过滤模型前言/总结
     text = re.sub(r'^(以下|下面)是?[^\n]*?(提取|识别|转换|输出|整理)[^\n]*?[:：]\s*', '', text)
     text = re.sub(r'^根据图片[^\n]*?[:：]\s*', '', text)
     text = re.sub(r'^图片中的[^\n]*?[:：]\s*', '', text)
+    # 过滤模型废话整行（各种自创指令、格式说明、与图片相关的废话）
+    text = re.sub(
+        r'^[^\n]*(?:仅对图片|与图片相关|不应包含在本文|非正文文本'
+        r'|使用Markdown格式|提交Word文档|有问题请发消息'
+        r'|字体字体大小|封面中需保持|左对齐|加粗标记|使用斜体'
+        r'|另外提供一个建议)[^\n]*$',
+        '', text, flags=re.MULTILINE
+    )
+    # 过滤模型自创的编号格式指令（如 "6. 只保留标识字符，不配"）
+    text = re.sub(
+        r'^\d+\.\s*(?:只保留|所有文字均|空的Markdown|同时提交)[^\n]*$',
+        '', text, flags=re.MULTILINE
+    )
     text = re.sub(r'\n{4,}', '\n\n\n', text)
     return text.strip()
 
@@ -34,6 +50,12 @@ def is_garbage(text: str) -> bool:
     cjk_en = len(re.findall(r'[\u4e00-\u9fff\u3000-\u303fa-zA-Z0-9，。！？、；：\u201c\u201d\u2018\u2019（）\s]', text))
     if len(text) > 50 and cjk_en / len(text) < 0.5:
         return True
+    # 竖排单字断行检测：大量连续单字行
+    lines = text.split('\n')
+    if len(lines) > 10:
+        single_char_lines = sum(1 for l in lines if len(l.strip()) == 1)
+        if single_char_lines / len(lines) > 0.5:
+            return True
     return False
 
 
