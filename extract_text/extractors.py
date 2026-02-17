@@ -12,7 +12,7 @@ import fitz
 import markdownify
 
 from .config import cfg
-from .clean import smart_clean
+from .clean import smart_clean, TEXT_ERROR, TEXT_OK
 from .ocr import process_ocr_page
 from .progress import load_progress, save_progress, delete_progress
 from .utils import shutdown_flag, parse_pages
@@ -30,33 +30,17 @@ def extract_epub(filepath: Path) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def extract_pdf_method(filepath: Path, default_method: str = "auto") -> str:
-    fc = cfg.get_file_config(filepath.name)
-    default_method = fc.get("method", default_method)
-    overrides = fc.get("overrides", [])
-
-    doc = fitz.open(str(filepath))
-    total = len(doc)
-
-    page_methods = {i: default_method for i in range(total)}
-    for ov in overrides:
-        pages = parse_pages(ov.get("pages", ""), total)
-        m = ov.get("method", default_method)
-        for p in pages:
-            page_methods[p] = m
-
-    results = load_progress(filepath)
-    if results:
-        print(f"  从进度文件恢复，已完成 {len(results)}/{total} 页")
-
-    results_lock = threading.Lock()
+def _run_ocr_pipeline(tasks: list[tuple], results: dict, results_lock: threading.Lock,
+                       filepath: Path, total: int):
+    """对给定任务列表执行 OCR 流水线，结果写入 results。"""
+    if not tasks or shutdown_flag.is_set():
+        return
     _unsaved_count = [0]
 
     def _collect_result(future, idx):
         try:
             _, text = future.result()
             if not text and not shutdown_flag.is_set():
-                print(f"  [页 {idx + 1} 结果为空，将在下次运行时重试]")
                 return
             with results_lock:
                 results[idx] = text
@@ -95,30 +79,15 @@ def extract_pdf_method(filepath: Path, default_method: str = "auto") -> str:
     consumer_thread.start()
 
     try:
-        print(f"  流水线处理 {total} 页 (workers={cfg.max_workers}, dpi={cfg.dpi})...")
-        for i in range(total):
+        for task in tasks:
             if shutdown_flag.is_set():
                 break
-            if i in results:
-                continue
-            page = doc[i]
-            method = page_methods[i]
-            text = page.get_text().strip()
-
-            needs_ocr = method in ("ai", "ocr") or (method in ("auto", "auto_ai") and len(text) < cfg.min_text_len)
-
-            if needs_ocr:
-                pix = page.get_pixmap(dpi=cfg.dpi)
-                img_bytes = pix.tobytes("png")
-                while not shutdown_flag.is_set():
-                    try:
-                        ocr_queue.put((i, total, method, text, img_bytes), timeout=0.5)
-                        break
-                    except queue.Full:
-                        continue
-            else:
-                with results_lock:
-                    results[i] = text
+            while not shutdown_flag.is_set():
+                try:
+                    ocr_queue.put(task, timeout=0.5)
+                    break
+                except queue.Full:
+                    continue
     finally:
         done_event.set()
         try:
@@ -130,14 +99,60 @@ def extract_pdf_method(filepath: Path, default_method: str = "auto") -> str:
         if shutdown_flag.is_set() and _executor_ref[0]:
             _executor_ref[0].shutdown(wait=False, cancel_futures=True)
         consumer_thread.join(timeout=3)
-        doc.close()
         save_progress(filepath, results)
 
+
+def extract_pdf_method(filepath: Path, default_method: str = "auto") -> str:
+    fc = cfg.get_file_config(filepath.name)
+    default_method = fc.get("method", default_method)
+    overrides = fc.get("overrides", [])
+
+    doc = fitz.open(str(filepath))
+    total = len(doc)
+
+    page_methods = {i: default_method for i in range(total)}
+    for ov in overrides:
+        pages = parse_pages(ov.get("pages", ""), total)
+        m = ov.get("method", default_method)
+        for p in pages:
+            page_methods[p] = m
+
+    results = load_progress(filepath)
+    if results:
+        print(f"  从进度文件恢复，已完成 {len(results)}/{total} 页")
+
+    results_lock = threading.Lock()
+
+    # === 第一轮 OCR ===
+    first_tasks = []
+    for i in range(total):
+        if shutdown_flag.is_set():
+            break
+        if i in results:
+            continue
+        page = doc[i]
+        method = page_methods[i]
+        text = page.get_text().strip()
+        needs_ocr = method in ("ai", "ocr") or (method in ("auto", "auto_ai") and len(text) < cfg.min_text_len)
+        if needs_ocr:
+            pix = page.get_pixmap(dpi=cfg.dpi)
+            img_bytes = pix.tobytes("png")
+            first_tasks.append((i, total, method, text, img_bytes))
+        else:
+            with results_lock:
+                results[i] = text
+
+    if first_tasks:
+        print(f"  流水线处理 {total} 页 (workers={cfg.max_workers}, dpi={cfg.dpi})...")
+        _run_ocr_pipeline(first_tasks, results, results_lock, filepath, total)
+
     if shutdown_flag.is_set():
+        doc.close()
         print(f"  已保存进度 ({len(results)}/{total} 页)")
         return ""
 
-    delete_progress(filepath)
+    # === 清洗阶段 + 收集需要重试的页面 ===
+    retry_pages: set[int] = set()
 
     if cfg.enable_clean:
         print(f"  正在使用文本模型清洗 ({cfg.clean_model})...")
@@ -147,10 +162,75 @@ def extract_pdf_method(filepath: Path, default_method: str = "auto") -> str:
                 break
             prev_text = results.get(sorted_keys[pos - 1], "") if pos > 0 else ""
             next_text = results.get(sorted_keys[pos + 1], "") if pos < len(sorted_keys) - 1 else ""
-            results[idx] = smart_clean(results[idx], prev_text, next_text)
-            print(f"    清洗 {idx + 1}/{total} 完成")
+            cleaned = smart_clean(results[idx], prev_text, next_text)
+            if cleaned == TEXT_ERROR:
+                print(f"    页 {idx + 1}/{total} 无法修复，标记重新OCR")
+                retry_pages.add(idx)
+                results.pop(idx, None)
+            elif cleaned != TEXT_OK:
+                results[idx] = cleaned
+                print(f"    清洗 {idx + 1}/{total} 已修正")
+            else:
+                print(f"    清洗 {idx + 1}/{total} 质量良好")
 
-    return "\n\n---\n\n".join(results.get(i, "") for i in sorted(results))
+    # === 重试阶段：循环重试失败页面 ===
+    max_retry_rounds = 3
+    for round_num in range(1, max_retry_rounds + 1):
+        if not retry_pages or shutdown_flag.is_set():
+            break
+        print(f"  重试第 {round_num}/{max_retry_rounds} 轮，共 {len(retry_pages)} 页...")
+        retry_tasks = []
+        for i in sorted(retry_pages):
+            page = doc[i]
+            method = page_methods[i]
+            # 重试时强制用 ai 方法
+            pix = page.get_pixmap(dpi=cfg.dpi)
+            img_bytes = pix.tobytes("png")
+            retry_tasks.append((i, total, "ai", "", img_bytes))
+
+        _run_ocr_pipeline(retry_tasks, results, results_lock, filepath, total)
+
+        if shutdown_flag.is_set():
+            break
+
+        # 检查重试结果，再次清洗
+        still_failed: set[int] = set()
+        for idx in sorted(retry_pages):
+            if shutdown_flag.is_set():
+                break
+            if idx not in results:
+                still_failed.add(idx)
+                continue
+            sorted_keys = sorted(results)
+            pos = sorted_keys.index(idx)
+            prev_text = results.get(sorted_keys[pos - 1], "") if pos > 0 else ""
+            next_text = results.get(sorted_keys[pos + 1], "") if pos < len(sorted_keys) - 1 else ""
+            cleaned = smart_clean(results[idx], prev_text, next_text)
+            if cleaned == TEXT_ERROR:
+                print(f"    页 {idx + 1} 重试后仍无法修复")
+                still_failed.add(idx)
+                results.pop(idx, None)
+            elif cleaned != TEXT_OK:
+                results[idx] = cleaned
+                print(f"    页 {idx + 1} 重试已修正")
+            else:
+                print(f"    页 {idx + 1} 重试质量良好")
+        retry_pages = still_failed
+
+    if retry_pages:
+        print(f"  警告：{len(retry_pages)} 页在 {max_retry_rounds} 轮重试后仍失败: {sorted(retry_pages)}")
+        # 最后兜底：用空文本占位
+        for idx in retry_pages:
+            results.setdefault(idx, "")
+
+    doc.close()
+
+    if shutdown_flag.is_set():
+        print(f"  已保存进度 ({len(results)}/{total} 页)")
+        return ""
+
+    delete_progress(filepath)
+    return "\n\n---\n\n".join(results.get(i, "") for i in range(total))
 
 
 def process_file(filepath: Path, method: str | None = None):

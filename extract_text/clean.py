@@ -7,6 +7,11 @@ from openai import OpenAI
 from .config import cfg
 from .utils import shutdown_flag
 
+# smart_clean 返回此常量表示文本无法修复，需要打回重新 OCR
+TEXT_ERROR = "text_error"
+# 清洗模型返回此值表示原文质量良好无需修改
+TEXT_OK = "TRUE"
+
 
 def clean_markdown(text: str) -> str:
     text = re.sub(r'<\|begin_of_box\|>', '', text)
@@ -53,7 +58,7 @@ def needs_clean_local(text: str) -> bool:
 
 
 def should_clean(text: str) -> bool:
-    """用 tool_model 快速判断是否需要清洗。"""
+    """用 tool_model 快速判断文本质量。始终调用，不省略。"""
     model = cfg.next_tool_model()
     if not model or shutdown_flag.is_set():
         return False
@@ -61,7 +66,19 @@ def should_clean(text: str) -> bool:
         client = OpenAI(api_key=cfg.api_key, base_url=cfg.api_base, timeout=30)
         resp = client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": f"以下文本是否包含OCR错误、乱码或需要修正的问题？只回答Y或N。\n\n{text[:500]}"}],
+            messages=[{"role": "user", "content": (
+                "你是OCR文本质量审核员。请判断以下文本是否存在需要修正的问题。\n"
+                "判断标准：\n"
+                "- 存在明显的OCR识别错误（如错别字、形近字混淆）\n"
+                "- 存在乱码、不可读字符\n"
+                "- 存在大段重复内容\n"
+                "- 存在模型幻觉（与书籍内容无关的生成内容）\n"
+                "- 格式严重混乱（如标题层级错误、列表格式损坏）\n\n"
+                "如果文本质量良好、内容通顺可读，回答N。\n"
+                "如果存在上述任何问题，回答Y。\n"
+                "只回答一个字母Y或N，不要解释。\n\n"
+                f"{text[:800]}"
+            )}],
             max_tokens=1,
         )
         return resp.choices[0].message.content.strip().upper().startswith("Y")
@@ -70,7 +87,7 @@ def should_clean(text: str) -> bool:
 
 
 def text_clean(text: str, prev_text: str = "", next_text: str = "") -> str:
-    """用文本模型清洗 OCR 结果。"""
+    """用文本模型清洗 OCR 结果。返回清洗后文本，或 TEXT_ERROR 表示无法修复。"""
     if not cfg.clean_model or not text or shutdown_flag.is_set():
         return text
     context = ""
@@ -85,23 +102,47 @@ def text_clean(text: str, prev_text: str = "", next_text: str = "") -> str:
             model=cfg.clean_model,
             messages=[{
                 "role": "user",
-                "content": f"以下是OCR识别的书籍页面文本，可能包含识别错误、乱码、重复内容或模型幻觉。请清洗并修正文本，只输出修正后的当前页内容，保留Markdown格式。如果内容本身就是正常的，原样输出即可。\n\n{context}",
+                "content": (
+                    "你是专业的OCR文本校对员。请对以下书籍页面的OCR识别结果进行校对和修正。\n\n"
+                    "## 工作规则\n"
+                    "1. 修正明显的OCR识别错误（形近字混淆、多余/缺失字符）\n"
+                    "2. 修正乱码和不可读字符\n"
+                    "3. 去除重复的段落或句子\n"
+                    "4. 去除模型幻觉内容（与上下文明显无关的生成内容）\n"
+                    "5. 保留原文的Markdown格式（标题、列表、粗体等）\n"
+                    "6. 不要添加任何解释、前言、总结或代码块标记\n"
+                    "7. 如果当前页内容完全是乱码、重复字句或无意义内容，无法修复，"
+                    "则只输出 TEXT_ERROR\n"
+                    "8. 如果内容质量良好、无需任何修改，只输出 TRUE\n"
+                    "9. 只有确实需要修正时，才输出修正后的完整当前页内容\n\n"
+                    "## 上下文参考（仅供理解语境，不要输出这些内容）\n\n"
+                    f"{context}"
+                ),
             }],
             max_tokens=4096,
         )
         cleaned = resp.choices[0].message.content.strip()
-        return clean_markdown(cleaned) if cleaned else text
+        if not cleaned:
+            return text
+        if cleaned == "TEXT_ERROR" or cleaned.startswith("TEXT_ERROR"):
+            return TEXT_ERROR
+        if cleaned == "TRUE" or cleaned == "True":
+            return TEXT_OK
+        return clean_markdown(cleaned)
     except Exception as e:
         print(f"  [文本清洗失败] {e}")
         return text
 
 
 def smart_clean(text: str, prev_text: str = "", next_text: str = "") -> str:
-    """三级过滤智能清洗。"""
+    """三级过滤智能清洗。返回：清洗后文本 / 原文本 / TEXT_ERROR。"""
     if not cfg.clean_model or not text or shutdown_flag.is_set():
         return text
+    # 本地规则命中 → 直接送清洗
     if needs_clean_local(text):
         return text_clean(text, prev_text, next_text)
+    # tool_model 判断 → 需要清洗则送清洗
     if should_clean(text):
         return text_clean(text, prev_text, next_text)
+    # 质量良好，保留原文
     return text
