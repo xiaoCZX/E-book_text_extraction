@@ -264,7 +264,7 @@ def ocr_vlm(image_bytes: bytes) -> str:
             except Exception as e:
                 if attempt < 2 and not _shutdown_flag.is_set():
                     err_str = str(e).lower()
-                    is_retryable = "429" in err_str or "rate" in err_str or "connection" in err_str or "timeout" in err_str
+                    is_retryable = any(k in err_str for k in ("429", "rate", "connection", "timeout", "500", "502", "503", "504"))
                     if not is_retryable:
                         raise
                     wait = (attempt + 1) * 3
