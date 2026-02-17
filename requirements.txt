@@ -1,0 +1,10 @@
+ebooklib
+markdownify
+PyMuPDF
+pytesseract
+Pillow
+openai
+python-docx
+mobi
+beautifulsoup4
+lxml
