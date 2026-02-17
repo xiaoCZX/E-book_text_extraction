@@ -2,6 +2,7 @@
 
 import base64
 import io
+import logging
 import time
 
 from openai import OpenAI
@@ -12,13 +13,15 @@ from .config import cfg
 from .clean import clean_markdown, is_garbage
 from .utils import shutdown_flag
 
+log = logging.getLogger(__name__)
+
 
 def ocr_tesseract(image_bytes: bytes) -> str:
     try:
         img = Image.open(io.BytesIO(image_bytes))
         return pytesseract.image_to_string(img, lang=cfg.tess_lang).strip()
     except Exception as e:
-        print(f"  [Tesseract 失败] {e}")
+        log.warning("Tesseract 失败: %s", e)
         return ""
 
 
@@ -33,6 +36,7 @@ def ocr_vlm(image_bytes: bytes) -> str:
             if shutdown_flag.is_set():
                 return ""
             try:
+                log.debug("VLM 请求 model=%s attempt=%d", model, attempt + 1)
                 resp = client.chat.completions.create(
                     model=model,
                     messages=[{
@@ -48,10 +52,12 @@ def ocr_vlm(image_bytes: bytes) -> str:
                 cleaned = clean_markdown(content)
                 if is_garbage(cleaned):
                     if attempt < 2 and not shutdown_flag.is_set():
-                        print(f"  [VLM 质量差，重试 {attempt + 1}/3 model={model}]")
+                        log.warning("VLM 质量差 model=%s attempt=%d/%d，切换模型重试", model, attempt + 1, 3)
                         model = cfg.next_model()
                         continue
+                    log.warning("VLM 3次均为垃圾输出 model=%s", model)
                     return ""
+                log.info("VLM 成功 model=%s len=%d", model, len(cleaned))
                 return cleaned
             except Exception as e:
                 if attempt < 2 and not shutdown_flag.is_set():
@@ -59,13 +65,13 @@ def ocr_vlm(image_bytes: bytes) -> str:
                     if not any(k in err_str for k in ("429", "rate", "connection", "timeout", "500", "502", "503", "504")):
                         raise
                     wait = (attempt + 1) * 3
-                    print(f"  [VLM 重试 {attempt + 1}/3 model={model}] {e} (等待{wait}s)")
+                    log.warning("VLM 重试 %d/3 model=%s err=%s 等待%ds", attempt + 1, model, e, wait)
                     time.sleep(wait)
                     model = cfg.next_model()
                     continue
                 raise
     except Exception as e:
-        print(f"  [VLM API 失败 model={model}] {e}")
+        log.error("VLM API 失败 model=%s: %s", model, e)
         return ""
 
 
@@ -73,7 +79,7 @@ def process_ocr_page(args: tuple) -> tuple[int, str]:
     idx, total, method, text, image_bytes = args
     if shutdown_flag.is_set():
         return idx, text
-    print(f"  OCR 第 {idx + 1}/{total} 页 [method={method}]...")
+    log.info("OCR 第 %d/%d 页 method=%s", idx + 1, total, method)
 
     if method == "ai":
         return idx, ocr_vlm(image_bytes)
@@ -81,10 +87,15 @@ def process_ocr_page(args: tuple) -> tuple[int, str]:
         return idx, ocr_tesseract(image_bytes)
     if method == "auto_ai":
         vlm_text = ocr_vlm(image_bytes)
-        return idx, vlm_text if vlm_text else text
+        if vlm_text:
+            return idx, vlm_text
+        log.debug("页 %d VLM 为空，回退到原文本 len=%d", idx + 1, len(text))
+        return idx, text
 
+    # auto 模式
     ocr_text = ocr_tesseract(image_bytes)
     if len(ocr_text) >= cfg.min_ocr_len:
+        log.debug("页 %d Tesseract 足够 len=%d", idx + 1, len(ocr_text))
         return idx, ocr_text
     vlm_text = ocr_vlm(image_bytes)
     return idx, vlm_text if vlm_text else text

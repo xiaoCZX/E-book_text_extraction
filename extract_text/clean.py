@@ -1,11 +1,14 @@
 """文本清洗：Markdown 清理、垃圾检测、智能清洗。"""
 
+import logging
 import re
 
 from openai import OpenAI
 
 from .config import cfg
 from .utils import shutdown_flag
+
+log = logging.getLogger(__name__)
 
 # smart_clean 返回此常量表示文本无法修复，需要打回重新 OCR
 TEXT_ERROR = "text_error"
@@ -18,13 +21,10 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r'<\|end_of_box\|>', '', text)
     text = re.sub(r'```markdown\s*', '', text)
     text = re.sub(r'```\s*', '', text)
-    # 清除 HTML 标签残留
     text = re.sub(r'</?(?:u|b|i|em|strong|h[1-6]|span|div|p|br|hr)\s*/?>', '', text, flags=re.IGNORECASE)
-    # 过滤模型前言/总结
     text = re.sub(r'^(以下|下面)是?[^\n]*?(提取|识别|转换|输出|整理)[^\n]*?[:：]\s*', '', text)
     text = re.sub(r'^根据图片[^\n]*?[:：]\s*', '', text)
     text = re.sub(r'^图片中的[^\n]*?[:：]\s*', '', text)
-    # 过滤模型废话整行（各种自创指令、格式说明、与图片相关的废话）
     text = re.sub(
         r'^[^\n]*(?:仅对图片|与图片相关|不应包含在本文|非正文文本'
         r'|使用Markdown格式|提交Word文档|有问题请发消息'
@@ -32,7 +32,6 @@ def clean_markdown(text: str) -> str:
         r'|另外提供一个建议)[^\n]*$',
         '', text, flags=re.MULTILINE
     )
-    # 过滤模型自创的编号格式指令（如 "6. 只保留标识字符，不配"）
     text = re.sub(
         r'^\d+\.\s*(?:只保留|所有文字均|空的Markdown|同时提交)[^\n]*$',
         '', text, flags=re.MULTILINE
@@ -50,7 +49,6 @@ def is_garbage(text: str) -> bool:
     cjk_en = len(re.findall(r'[\u4e00-\u9fff\u3000-\u303fa-zA-Z0-9，。！？、；：\u201c\u201d\u2018\u2019（）\s]', text))
     if len(text) > 50 and cjk_en / len(text) < 0.5:
         return True
-    # 竖排单字断行检测：大量连续单字行
     lines = text.split('\n')
     if len(lines) > 10:
         single_char_lines = sum(1 for l in lines if len(l.strip()) == 1)
@@ -80,11 +78,12 @@ def needs_clean_local(text: str) -> bool:
 
 
 def should_clean(text: str) -> bool:
-    """用 tool_model 快速判断文本质量。始终调用，不省略。"""
+    """用 tool_model 快速判断文本质量。"""
     model = cfg.next_tool_model()
     if not model or shutdown_flag.is_set():
         return False
     try:
+        log.debug("should_clean 请求 model=%s", model)
         client = OpenAI(api_key=cfg.api_key, base_url=cfg.api_base, timeout=30)
         resp = client.chat.completions.create(
             model=model,
@@ -103,13 +102,16 @@ def should_clean(text: str) -> bool:
             )}],
             max_tokens=1,
         )
-        return resp.choices[0].message.content.strip().upper().startswith("Y")
-    except Exception:
+        result = resp.choices[0].message.content.strip().upper().startswith("Y")
+        log.info("should_clean model=%s result=%s", model, "Y" if result else "N")
+        return result
+    except Exception as e:
+        log.warning("should_clean 失败 model=%s: %s，默认需要清洗", model, e)
         return True
 
 
 def text_clean(text: str, prev_text: str = "", next_text: str = "") -> str:
-    """用文本模型清洗 OCR 结果。返回清洗后文本，或 TEXT_ERROR 表示无法修复。"""
+    """用文本模型清洗 OCR 结果。"""
     if not cfg.clean_model or not text or shutdown_flag.is_set():
         return text
     context = ""
@@ -119,6 +121,7 @@ def text_clean(text: str, prev_text: str = "", next_text: str = "") -> str:
     if next_text:
         context += f"\n[下一页开头]\n{next_text[:200]}"
     try:
+        log.debug("text_clean 请求 model=%s", cfg.clean_model)
         client = OpenAI(api_key=cfg.api_key, base_url=cfg.api_base, timeout=60)
         resp = client.chat.completions.create(
             model=cfg.clean_model,
@@ -145,14 +148,18 @@ def text_clean(text: str, prev_text: str = "", next_text: str = "") -> str:
         )
         cleaned = resp.choices[0].message.content.strip()
         if not cleaned:
+            log.warning("text_clean 返回空 model=%s", cfg.clean_model)
             return text
         if cleaned == "TEXT_ERROR" or cleaned.startswith("TEXT_ERROR"):
+            log.info("text_clean 判定 TEXT_ERROR model=%s", cfg.clean_model)
             return TEXT_ERROR
         if cleaned == "TRUE" or cleaned == "True":
+            log.info("text_clean 判定 TRUE（质量良好）model=%s", cfg.clean_model)
             return TEXT_OK
+        log.info("text_clean 已修正 model=%s len=%d→%d", cfg.clean_model, len(text), len(cleaned))
         return clean_markdown(cleaned)
     except Exception as e:
-        print(f"  [文本清洗失败] {e}")
+        log.error("text_clean 失败 model=%s: %s", cfg.clean_model, e)
         return text
 
 
@@ -160,11 +167,9 @@ def smart_clean(text: str, prev_text: str = "", next_text: str = "") -> str:
     """三级过滤智能清洗。返回：清洗后文本 / 原文本 / TEXT_ERROR。"""
     if not cfg.clean_model or not text or shutdown_flag.is_set():
         return text
-    # 本地规则命中 → 直接送清洗
     if needs_clean_local(text):
+        log.info("本地规则命中，直接送清洗")
         return text_clean(text, prev_text, next_text)
-    # tool_model 判断 → 需要清洗则送清洗
     if should_clean(text):
         return text_clean(text, prev_text, next_text)
-    # 质量良好，保留原文
     return text

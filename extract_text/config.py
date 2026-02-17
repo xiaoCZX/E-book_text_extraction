@@ -136,7 +136,7 @@ def init_globals(raw_cfg: dict, args):
 
     # Workers
     if args.w_full:
-        cfg.max_workers = min((os.cpu_count() or 4) * 4, 32)
+        cfg.max_workers = min((os.cpu_count() or 4) * 4, 196)
     elif args.workers:
         cfg.max_workers = args.workers
     else:

@@ -208,6 +208,7 @@ __marimo__/
 
 input/
 output/
+log/
 
 plans/
 
@@ -222,3 +223,5 @@ plans/
 *config.toml
 
 *.md
+
+.vscode/
