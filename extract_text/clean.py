@@ -1,7 +1,11 @@
 """文本清洗：Markdown 清理、垃圾检测、智能清洗。"""
 
+import base64
+from typing import List, Dict, Union, Optional
+
 import logging
 import re
+from typing import Optional
 
 from openai import OpenAI
 
@@ -41,19 +45,42 @@ def clean_markdown(text: str) -> str:
 
 
 def is_garbage(text: str) -> bool:
-    """检测模型幻觉/垃圾输出。"""
+    """检测明显的垃圾输出。"""
     if not text or len(text) < 10:
         return True
+    
+    # 1. 检测大段重复
     for _ in re.finditer(r'(.{4,50})\1{4,}', text):
         return True
+    
+    # 2. 检测非中日韩字符比例过高（长度>50时）
     cjk_en = len(re.findall(r'[\u4e00-\u9fff\u3000-\u303fa-zA-Z0-9，。！？、；：\u201c\u201d\u2018\u2019（）\s]', text))
-    if len(text) > 50 and cjk_en / len(text) < 0.5:
+    if len(text) > 50 and cjk_en / len(text) < 0.3:  # 降低阈值到0.3
         return True
+    
+    # 3. 检测单字符行过多
     lines = text.split('\n')
     if len(lines) > 10:
         single_char_lines = sum(1 for l in lines if len(l.strip()) == 1)
         if single_char_lines / len(lines) > 0.5:
             return True
+    
+    # 4. 检测模型幻觉关键词（更全面的模式）
+    hallucination_patterns = [
+        r'整个.*?文档.*?没有.*?文字',
+        r'输出源码和样式生成的图片内容',
+        r'为了达到.*?目的.*?可以按照.*?语法.*?转换',
+        r'建议图片不包含.*?相关文字',
+        r'上传图片后移除图片文字内容',
+        r'用.*?语法输出',
+        r'//\s*end\.?',
+        r'本文档.*?内容',
+        r'系统.*?生成.*?图片',
+    ]
+    for pattern in hallucination_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+            
     return False
 
 
@@ -77,29 +104,53 @@ def needs_clean_local(text: str) -> bool:
     return False
 
 
-def should_clean(text: str) -> bool:
+def should_clean(text: str, image_bytes: Optional[bytes] = None, filename: str = "") -> bool:
     """用 tool_model 快速判断文本质量。"""
     model = cfg.next_tool_model()
     if not model or shutdown_flag.is_set():
         return False
     try:
+        # 构建消息内容
+        text_content = (
+            "你是OCR文本质量审核员。请结合图片判断以下文本是否存在需要修正的问题。\n"
+            "判断标准：\n"
+            "- 存在明显的OCR识别错误（如错别字、形近字混淆）\n"
+            "- 存在乱码、不可读字符\n"
+            "- 存在大段重复内容\n"
+            "- 存在模型幻觉（与书籍内容无关的生成内容）\n"
+            "- 格式严重混乱（如标题层级错误、列表格式损坏）\n\n"
+            "如果文本质量良好、内容通顺可读，回答N。\n"
+            "如果当前页是空白页，且文本内容也为空，回答N。\n"
+            "如果存在上述任何问题，回答Y。\n"
+            "只回答一个字母Y或N，不要解释。\n\n"
+        )
+        
+        # 构建消息内容
+        if image_bytes and filename:
+            b64 = base64.b64encode(image_bytes).decode()
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": text_content},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                        {"type": "text", "text": f"\n\n文件名: {filename}\n文本内容:\n{text[:800]}"}
+                    ]
+                }
+            ]
+        else:
+            messages = [
+                {
+                    "role": "user",
+                    "content": f"{text_content}{text[:800]}"
+                }
+            ]
+            
         log.debug("should_clean 请求 model=%s", model)
         client = OpenAI(api_key=cfg.api_key, base_url=cfg.api_base, timeout=30)
         resp = client.chat.completions.create(
             model=model,
-            messages=[{"role": "user", "content": (
-                "你是OCR文本质量审核员。请判断以下文本是否存在需要修正的问题。\n"
-                "判断标准：\n"
-                "- 存在明显的OCR识别错误（如错别字、形近字混淆）\n"
-                "- 存在乱码、不可读字符\n"
-                "- 存在大段重复内容\n"
-                "- 存在模型幻觉（与书籍内容无关的生成内容）\n"
-                "- 格式严重混乱（如标题层级错误、列表格式损坏）\n\n"
-                "如果文本质量良好、内容通顺可读，回答N。\n"
-                "如果存在上述任何问题，回答Y。\n"
-                "只回答一个字母Y或N，不要解释。\n\n"
-                f"{text[:800]}"
-            )}],
+            messages=messages,
             max_tokens=1,
         )
         result = resp.choices[0].message.content.strip().upper().startswith("Y")
@@ -110,40 +161,66 @@ def should_clean(text: str) -> bool:
         return True
 
 
-def text_clean(text: str, prev_text: str = "", next_text: str = "") -> str:
+def text_clean(text: str, prev_text: str = "", next_text: str = "",
+               image_bytes: Optional[bytes] = None, filename: str = "") -> str:
     """用文本模型清洗 OCR 结果。"""
     if not cfg.clean_model or not text or shutdown_flag.is_set():
         return text
+    
+    # 构建上下文
     context = ""
     if prev_text:
         context += f"[上一页末尾]\n{prev_text[-200:]}\n\n"
     context += f"[当前页内容]\n{text}\n"
     if next_text:
         context += f"\n[下一页开头]\n{next_text[:200]}"
+    
     try:
+        # 构建消息内容
+        system_prompt = (
+            "你是专业的OCR文本校对员。请对以下书籍页面的OCR识别结果进行校对和修正。\n\n"
+            "## 工作规则\n"
+            "1. 修正明显的OCR识别错误（形近字混淆、多余/缺失字符）\n"
+            "2. 修正乱码和不可读字符\n"
+            "3. 去除重复的段落或句子\n"
+            "4. 去除模型幻觉内容（与上下文明显无关的生成内容）\n"
+            "5. 保留原文的Markdown格式（标题、列表、粗体等）\n"
+            "6. 不要添加任何解释、前言、总结或代码块标记\n"
+            "7. 如果当前页内容完全是乱码、重复字句或无意义内容，无法修复，"
+            "则只输出 TEXT_ERROR\n"
+            "8. 如果内容质量良好、无需任何修改，只输出 TRUE\n"
+            "如果当前页是空白页，且文本内容也为空，则输出 TRUE\n"
+            "如果当前页是空白页，但文本内容不为空，则输出为空内容\n"
+            "9. 只有确实需要修正时，才输出修正后的完整当前页内容\n\n"
+            "ACTIONS:绝对禁止凭空臆造、输出提示词等行为！！！\n"
+        )
+        
+        # 构建消息内容
+        if image_bytes and filename:
+            b64 = base64.b64encode(image_bytes).decode()
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": system_prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                        {"type": "text", "text": f"\n\n文件名: {filename}\n## 上下文参考（仅供理解语境，不要输出这些内容）\n\n{context}"}
+                    ]
+                }
+            ]
+        else:
+            messages = [
+                {
+                    "role": "user",
+                    "content": f"{system_prompt}## 上下文参考（仅供理解语境，不要输出这些内容）\n\n{context}"
+                }
+            ]
+            
         log.debug("text_clean 请求 model=%s", cfg.clean_model)
         client = OpenAI(api_key=cfg.api_key, base_url=cfg.api_base, timeout=60)
         resp = client.chat.completions.create(
             model=cfg.clean_model,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "你是专业的OCR文本校对员。请对以下书籍页面的OCR识别结果进行校对和修正。\n\n"
-                    "## 工作规则\n"
-                    "1. 修正明显的OCR识别错误（形近字混淆、多余/缺失字符）\n"
-                    "2. 修正乱码和不可读字符\n"
-                    "3. 去除重复的段落或句子\n"
-                    "4. 去除模型幻觉内容（与上下文明显无关的生成内容）\n"
-                    "5. 保留原文的Markdown格式（标题、列表、粗体等）\n"
-                    "6. 不要添加任何解释、前言、总结或代码块标记\n"
-                    "7. 如果当前页内容完全是乱码、重复字句或无意义内容，无法修复，"
-                    "则只输出 TEXT_ERROR\n"
-                    "8. 如果内容质量良好、无需任何修改，只输出 TRUE\n"
-                    "9. 只有确实需要修正时，才输出修正后的完整当前页内容\n\n"
-                    "## 上下文参考（仅供理解语境，不要输出这些内容）\n\n"
-                    f"{context}"
-                ),
-            }],
+            messages=messages,
             max_tokens=4096,
         )
         cleaned = resp.choices[0].message.content.strip()
@@ -163,13 +240,24 @@ def text_clean(text: str, prev_text: str = "", next_text: str = "") -> str:
         return text
 
 
-def smart_clean(text: str, prev_text: str = "", next_text: str = "") -> str:
+def smart_clean(text: str, prev_text: str = "", next_text: str = "",
+                image_bytes: Optional[bytes] = None, filename: str = "") -> str:
     """三级过滤智能清洗。返回：清洗后文本 / 原文本 / TEXT_ERROR。"""
-    if not cfg.clean_model or not text or shutdown_flag.is_set():
+    if not text or shutdown_flag.is_set():
         return text
+    
+    # 如果未配置清洗模型，跳过清洗步骤
+    if not cfg.clean_model:
+        log.debug("clean_model 未配置，跳过清洗")
+        return text
+        
+    # 1. 本地规则检测
     if needs_clean_local(text):
         log.info("本地规则命中，直接送清洗")
-        return text_clean(text, prev_text, next_text)
-    if should_clean(text):
-        return text_clean(text, prev_text, next_text)
+        return text_clean(text, prev_text, next_text, image_bytes, filename)
+        
+    # 2. 模型判断是否需要清洗
+    if should_clean(text, image_bytes, filename):
+        return text_clean(text, prev_text, next_text, image_bytes, filename)
+        
     return text

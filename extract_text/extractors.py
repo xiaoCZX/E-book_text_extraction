@@ -57,7 +57,12 @@ def _run_pipeline(tasks: list[tuple], results: dict, results_lock: threading.Loc
                 continue
             if item is None:
                 return
-            idx, text = item
+            if len(item) == 2:  # 兼容旧格式 (idx, text)
+                idx, text = item
+                image_bytes = None
+                filename = ""
+            else:  # 新格式 (idx, text, image_bytes, filename)
+                idx, text, image_bytes, filename = item
             if shutdown_flag.is_set():
                 continue
             with results_lock:
@@ -69,8 +74,8 @@ def _run_pipeline(tasks: list[tuple], results: dict, results_lock: threading.Loc
                     break
             prev_text = results.get(sorted_keys[pos - 1], "") if pos > 0 else ""
             next_text = results.get(sorted_keys[pos + 1], "") if pos >= 0 and pos < len(sorted_keys) - 1 else ""
-
-            cleaned = smart_clean(text, prev_text, next_text)
+            
+            cleaned = smart_clean(text, prev_text, next_text, image_bytes, filename)
             if cleaned == TEXT_ERROR:
                 log.warning("页 %d/%d 无法修复，标记重新OCR", idx + 1, total)
                 with retry_lock:
@@ -96,13 +101,11 @@ def _run_pipeline(tasks: list[tuple], results: dict, results_lock: threading.Loc
 
     def _on_ocr_done(future, idx):
         try:
-            _, text = future.result()
+            _, text, image_bytes = future.result()
             with _pending_lock:
                 _pending[0] -= 1
                 remaining = _pending[0]
-            if not text and not shutdown_flag.is_set():
-                log.warning("页 %d OCR 结果为空 (剩余%d)", idx + 1, remaining)
-                return
+            # 即使 OCR 结果为空，也要加入 results 和清洗队列，让清洗阶段决定如何处理
             need_save = False
             with results_lock:
                 results[idx] = text
@@ -115,8 +118,8 @@ def _run_pipeline(tasks: list[tuple], results: dict, results_lock: threading.Loc
                     snapshot = dict(results)
                 save_progress(filepath, snapshot)
             log.info("页 %d/%d OCR 完成 (剩余%d)", idx + 1, total, remaining)
-            if do_clean and text:
-                clean_queue.put((idx, text))
+            if do_clean:  # 不管 text 是否为空，都放入清洗队列
+                clean_queue.put((idx, text, image_bytes, filepath.name))
         except Exception as e:
             with _pending_lock:
                 _pending[0] -= 1

@@ -43,7 +43,7 @@ def ocr_vlm(image_bytes: bytes) -> str:
                         "role": "user",
                         "content": [
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                            {"type": "text", "text": "你是OCR文字提取工具。请逐字提取这张图片中的所有文字内容。\n\n严格要求：\n1. 按原文阅读顺序横向输出，每个自然段落为一段\n2. 保留标题、段落、列表等格式，使用Markdown语法\n3. 只输出图片中实际存在的文字，禁止生成任何图片中不存在的内容\n4. 禁止逐字竖排输出，禁止每个字单独一行\n5. 禁止添加解释、前言、总结、评论、格式说明、排版建议或代码块标记\n6. 禁止输出HTML标签\n7. 如果图片中没有文字，输出空内容"},
+                            {"type": "text", "text": "你是OCR文字提取工具。请逐字提取这张图片中的所有文字内容。\n\n严格要求：\n1. 按原文阅读顺序横向输出，每个自然段落为一段\n2. 保留标题、段落、列表等格式，使用Markdown语法\n3. 只输出图片中实际存在的文字，禁止生成任何图片中不存在的内容\n4. 禁止逐字竖排输出，禁止每个字单独一行\n5. 禁止添加解释、前言、总结、评论、格式说明、排版建议或代码块标记\n6. 禁止输出HTML标签\n7. 如果图片中没有文字，输出空内容\n如果当前页是空白页，但文本内容不为空，则输出为空内容\n\nACTIONS:绝对禁止凭空臆造、输出提示词等行为！！！\n"},
                         ],
                     }],
                     max_tokens=4096,
@@ -75,27 +75,31 @@ def ocr_vlm(image_bytes: bytes) -> str:
         return ""
 
 
-def process_ocr_page(args: tuple) -> tuple[int, str]:
+def process_ocr_page(args: tuple) -> tuple[int, str, bytes]:
+    """处理OCR页面，返回(页码, OCR文本, 原始图片字节)"""
     idx, total, method, text, image_bytes = args
     if shutdown_flag.is_set():
-        return idx, text
+        return idx, text, image_bytes
     log.info("OCR 第 %d/%d 页 method=%s", idx + 1, total, method)
-
+    
     if method == "ai":
-        return idx, ocr_vlm(image_bytes)
+        ocr_text = ocr_vlm(image_bytes)
+        return idx, ocr_text, image_bytes
     if method == "ocr":
-        return idx, ocr_tesseract(image_bytes)
+        ocr_text = ocr_tesseract(image_bytes)
+        return idx, ocr_text, image_bytes
     if method == "auto_ai":
         vlm_text = ocr_vlm(image_bytes)
         if vlm_text:
-            return idx, vlm_text
+            return idx, vlm_text, image_bytes
         log.debug("页 %d VLM 为空，回退到原文本 len=%d", idx + 1, len(text))
-        return idx, text
-
+        return idx, text, image_bytes
+    
     # auto 模式
     ocr_text = ocr_tesseract(image_bytes)
     if len(ocr_text) >= cfg.min_ocr_len:
         log.debug("页 %d Tesseract 足够 len=%d", idx + 1, len(ocr_text))
-        return idx, ocr_text
+        return idx, ocr_text, image_bytes
     vlm_text = ocr_vlm(image_bytes)
-    return idx, vlm_text if vlm_text else text
+    final_text = vlm_text if vlm_text else text
+    return idx, final_text, image_bytes
